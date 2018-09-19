@@ -27,6 +27,16 @@ RACE := $(shell test $$(go env GOARCH) != "amd64" || (echo "-race"))
 
 all: format build test
 
+VERSION := `git describe --tags`
+PACKAGE := mongodb_exporter-$(VERSION).linux-amd64
+
+package: build
+	rm -rf $(PACKAGE)
+	mkdir $(PACKAGE)
+	cp -fva mongodb_exporter $(PACKAGE)/
+	cp -fva *.md LICENSE NOTICE $(PACKAGE)/
+	tar -czvpf $(PACKAGE).tar.gz $(PACKAGE)
+
 style:
 	@echo ">> checking code style"
 	@! gofmt -d $(shell find . -path ./vendor -prune -o -name '*.go' -print) | grep '^'
