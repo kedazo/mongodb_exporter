@@ -47,7 +47,7 @@ PACKAGE := mongodb_exporter-$(VERSION).linux-amd64
 package: build
 	rm -rf $(PACKAGE)
 	mkdir $(PACKAGE)
-	cp -fva mongodb_exporter $(PACKAGE)/
+	cp -fva bin/mongodb_exporter $(PACKAGE)/
 	cp -fva *.md LICENSE NOTICE $(PACKAGE)/
 	tar -czvpf $(PACKAGE).tar.gz $(PACKAGE)
 
