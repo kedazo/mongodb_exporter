@@ -15,12 +15,14 @@
 package mongod
 
 import (
+	"context"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 var (
@@ -73,17 +75,29 @@ var (
 		Name:      "member_state",
 		Help:      "The value of state is an integer between 0 and 10 that represents the replica state of the member.",
 	}, []string{"set", "name", "state"})
-	memberUptime = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: Namespace,
-		Subsystem: subsystem,
-		Name:      "member_uptime",
-		Help:      "The uptime field holds a value that reflects the number of seconds that this member has been online.",
-	}, []string{"set", "name", "state"})
+	memberUptimeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(Namespace, subsystem, "member_uptime"),
+		"The uptime field holds a value that reflects the number of seconds that this member has been online.",
+		[]string{"set", "name", "state"},
+		nil,
+	)
 	memberOptimeDate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: Namespace,
 		Subsystem: subsystem,
 		Name:      "member_optime_date",
 		Help:      "The timestamp of the last oplog entry that this member applied.",
+	}, []string{"set", "name", "state"})
+	memberRepLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Subsystem: subsystem,
+		Name:      "member_replication_lag",
+		Help:      "The replication lag that this member has with the primary.",
+	}, []string{"set", "name", "state"})
+	memberOperationalLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Subsystem: subsystem,
+		Name:      "member_operational_lag",
+		Help:      "The operationl lag - or staleness of the oplog timestamp - for this member.",
 	}, []string{"set", "name", "state"})
 	memberElectionDate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: Namespace,
@@ -115,6 +129,8 @@ var (
 		Name:      "member_config_version",
 		Help:      "The configVersion value is the replica set configuration version.",
 	}, []string{"set", "name", "state"})
+	primaryOptimeDate        float64
+	primaryLastHeartbeatRecv float64
 )
 
 // ReplSetStatus keeps the data returned by the GetReplSetStatus method
@@ -125,26 +141,28 @@ type ReplSetStatus struct {
 	Term                    *int32    `bson:"term,omitempty"`
 	HeartbeatIntervalMillis *float64  `bson:"heartbeatIntervalMillis,omitempty"`
 	Members                 []Member  `bson:"members"`
+
+	Ok float64 `bson:"ok"`
 }
 
 // Member represents an array element of ReplSetStatus.Members
 type Member struct {
-	Name                 string      `bson:"name"`
-	Self                 *bool       `bson:"self,omitempty"`
-	Health               *int32      `bson:"health,omitempty"`
-	State                int32       `bson:"state"`
-	StateStr             string      `bson:"stateStr"`
-	Uptime               float64     `bson:"uptime"`
-	Optime               interface{} `bson:"optime"`
-	OptimeDate           time.Time   `bson:"optimeDate"`
-	ElectionTime         *time.Time  `bson:"electionTime,omitempty"`
-	ElectionDate         *time.Time  `bson:"electionDate,omitempty"`
-	LastHeartbeat        *time.Time  `bson:"lastHeartbeat,omitempty"`
-	LastHeartbeatRecv    *time.Time  `bson:"lastHeartbeatRecv,omitempty"`
-	LastHeartbeatMessage *string     `bson:"lastHeartbeatMessage,omitempty"`
-	PingMs               *float64    `bson:"pingMs,omitempty"`
-	SyncingTo            *string     `bson:"syncingTo,omitempty"`
-	ConfigVersion        *int32      `bson:"configVersion,omitempty"`
+	Name                 string              `bson:"name"`
+	Self                 *bool               `bson:"self,omitempty"`
+	Health               *int32              `bson:"health,omitempty"`
+	State                int32               `bson:"state"`
+	StateStr             string              `bson:"stateStr"`
+	Uptime               float64             `bson:"uptime"`
+	Optime               interface{}         `bson:"optime"`
+	OptimeDate           time.Time           `bson:"optimeDate"`
+	ElectionTime         primitive.Timestamp `bson:"electionTime,omitempty"`
+	ElectionDate         *time.Time          `bson:"electionDate,omitempty"`
+	LastHeartbeat        *time.Time          `bson:"lastHeartbeat,omitempty"`
+	LastHeartbeatRecv    *time.Time          `bson:"lastHeartbeatRecv,omitempty"`
+	LastHeartbeatMessage *string             `bson:"lastHeartbeatMessage,omitempty"`
+	PingMs               *float64            `bson:"pingMs,omitempty"`
+	SyncingTo            *string             `bson:"syncingTo,omitempty"`
+	ConfigVersion        *int32              `bson:"configVersion,omitempty"`
 }
 
 // Export exports the replSetGetStatus stati to be consumed by prometheus
@@ -156,8 +174,9 @@ func (replStatus *ReplSetStatus) Export(ch chan<- prometheus.Metric) {
 	heartbeatIntervalMillis.Reset()
 	memberState.Reset()
 	memberHealth.Reset()
-	memberUptime.Reset()
 	memberOptimeDate.Reset()
+	memberRepLag.Reset()
+	memberOperationalLag.Reset()
 	memberElectionDate.Reset()
 	memberLastHeartbeat.Reset()
 	memberLastHeartbeatRecv.Reset()
@@ -176,6 +195,21 @@ func (replStatus *ReplSetStatus) Export(ch chan<- prometheus.Metric) {
 	// new in version 3.2
 	if replStatus.HeartbeatIntervalMillis != nil {
 		heartbeatIntervalMillis.WithLabelValues(replStatus.Set).Set(*replStatus.HeartbeatIntervalMillis)
+	}
+
+	// Find the Optime and the LastHeartbeatRecv for the Primary.
+	for _, member := range replStatus.Members {
+		if member.StateStr == "PRIMARY" {
+			// Needed to calcule the replication lag for secondaries.
+			primaryOptimeDate = float64(member.OptimeDate.Unix())
+			// Needed to calcule the operationl lag.
+			if member.LastHeartbeatRecv != nil {
+				primaryLastHeartbeatRecv = float64((*member.LastHeartbeatRecv).Unix())
+			} else {
+				primaryLastHeartbeatRecv = 0
+			}
+			break
+		}
 	}
 
 	for _, member := range replStatus.Members {
@@ -199,9 +233,14 @@ func (replStatus *ReplSetStatus) Export(ch chan<- prometheus.Metric) {
 			memberHealth.With(ls).Set(float64(*member.Health))
 		}
 
-		memberUptime.With(ls).Set(member.Uptime)
+		ch <- prometheus.MustNewConstMetric(memberUptimeDesc, prometheus.CounterValue, member.Uptime, replStatus.Set, member.Name, member.StateStr)
 
 		memberOptimeDate.With(ls).Set(float64(member.OptimeDate.Unix()))
+
+		if member.StateStr == "SECONDARY" {
+			memberRepLag.With(ls).Set(primaryOptimeDate - float64(member.OptimeDate.Unix()))
+			memberOperationalLag.With(ls).Set(float64(replStatus.Date.Unix()) - primaryLastHeartbeatRecv)
+		}
 
 		// ReplSetGetStatus.Member.ElectionTime is only available on the PRIMARY
 		if member.ElectionDate != nil {
@@ -229,8 +268,9 @@ func (replStatus *ReplSetStatus) Export(ch chan<- prometheus.Metric) {
 	heartbeatIntervalMillis.Collect(ch)
 	memberState.Collect(ch)
 	memberHealth.Collect(ch)
-	memberUptime.Collect(ch)
 	memberOptimeDate.Collect(ch)
+	memberRepLag.Collect(ch)
+	memberOperationalLag.Collect(ch)
 	memberElectionDate.Collect(ch)
 	memberLastHeartbeat.Collect(ch)
 	memberLastHeartbeatRecv.Collect(ch)
@@ -248,18 +288,21 @@ func (replStatus *ReplSetStatus) Describe(ch chan<- *prometheus.Desc) {
 	heartbeatIntervalMillis.Describe(ch)
 	memberState.Describe(ch)
 	memberHealth.Describe(ch)
-	memberUptime.Describe(ch)
 	memberOptimeDate.Describe(ch)
+	memberRepLag.Describe(ch)
+	memberOperationalLag.Describe(ch)
 	memberElectionDate.Describe(ch)
 	memberLastHeartbeatRecv.Describe(ch)
 	memberPingMs.Describe(ch)
 	memberConfigVersion.Describe(ch)
+
+	ch <- memberUptimeDesc
 }
 
 // GetReplSetStatus returns the replica status info
-func GetReplSetStatus(session *mgo.Session) *ReplSetStatus {
+func GetReplSetStatus(client *mongo.Client) *ReplSetStatus {
 	result := &ReplSetStatus{}
-	err := session.DB("admin").Run(bson.D{{"replSetGetStatus", 1}}, result)
+	err := client.Database("admin").RunCommand(context.TODO(), bson.D{{"replSetGetStatus", 1}}).Decode(result)
 	if err != nil {
 		log.Errorf("Failed to get replSet status: %s", err)
 		return nil

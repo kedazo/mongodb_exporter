@@ -21,7 +21,9 @@ import (
 	"runtime"
 	"strconv"
 
-	"gopkg.in/mgo.v2"
+	"github.com/Masterminds/semver"
+	"github.com/prometheus/common/log"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 func LoadCaFrom(pemFile string) (*x509.CertPool, error) {
@@ -42,12 +44,33 @@ func LoadKeyPairFrom(pemFile string, privateKeyPemFile string) (tls.Certificate,
 	return tls.LoadX509KeyPair(pemFile, targetPrivateKeyPemFile)
 }
 
-// AddCodeCommentToQuery adds location of the caller in the source code (e.g. "oplog_status.go:91")
-// to the given query as a comment.
-func AddCodeCommentToQuery(query *mgo.Query) *mgo.Query {
+// GetCallerLocation gets location of the caller in the source code (e.g. "oplog_status.go:91").
+func GetCallerLocation() string {
 	_, fileName, lineNum, ok := runtime.Caller(1)
 	if !ok {
-		return query
+		return ""
 	}
-	return query.Comment(fileName + ":" + strconv.Itoa(lineNum))
+	return fileName + ":" + strconv.Itoa(lineNum)
+}
+
+func MongoServerVersionLessThan(version string, client *mongo.Client) bool {
+	serverVersion, err := MongoSessionServerVersion(client)
+	if err != nil {
+		log.Errorf("couldn't get mongo server version from server, reason: %v", err)
+		return false
+	}
+
+	srvVersion, err := semver.NewVersion(serverVersion)
+	if err != nil {
+		log.Errorf("couldn't parse mongo server version '%s', reason: %v", serverVersion, err)
+		return false
+	}
+
+	v, err := semver.NewVersion(version)
+	if err != nil {
+		log.Errorf("couldn't parse version '%s', reason: %v", version, err)
+		return false
+	}
+
+	return srvVersion.LessThan(v)
 }
